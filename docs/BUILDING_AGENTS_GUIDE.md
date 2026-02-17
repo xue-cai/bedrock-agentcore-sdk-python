@@ -264,7 +264,9 @@ app.run()
 
 The SDK is **framework-agnostic by design**. Here's how you'd use other popular frameworks:
 
-**LangGraph** (hypothesis — not directly in the repo, but the architecture supports it):
+**LangGraph:**
+
+> **Note:** LangGraph is not included in this repository, but the SDK's framework-agnostic design means it works with any Python agent framework. The following is an illustrative example based on LangGraph's public API.
 
 ```python
 from bedrock_agentcore import BedrockAgentCoreApp
@@ -282,7 +284,9 @@ async def invoke(payload):
 app.run()
 ```
 
-**CrewAI** (hypothesis — same pattern):
+**CrewAI:**
+
+> **Note:** CrewAI is not included in this repository. The following is an illustrative example showing the same framework-agnostic pattern.
 
 ```python
 from bedrock_agentcore import BedrockAgentCoreApp
@@ -356,7 +360,7 @@ def invoke(payload):
 app.run()
 ```
 
-**How Strands tools work (hypothesis based on Strands SDK patterns):** When you decorate a function with `@tool`, Strands converts it into a tool schema that the LLM can call. When the LLM decides to use a tool, Strands intercepts the tool call, executes your function, and passes the result back to the LLM for incorporation into the response.
+**How Strands tools work:** Based on the Strands SDK's public documentation, when you decorate a function with `@tool`, Strands converts it into a tool schema that the LLM can call. When the LLM decides to use a tool, Strands intercepts the tool call, executes your function, and passes the result back to the LLM for incorporation into the response. See the [Strands Agents documentation](https://github.com/strands-agents/sdk-python) for details.
 
 #### Cloud Browser Tool
 
@@ -487,7 +491,7 @@ memory = client.create_memory_and_wait(
 )
 ```
 
-**How strategies work (hypothesis based on API patterns and documentation):** When events are created in the memory, AgentCore's backend asynchronously processes them through configured strategies. These strategies use LLMs to extract structured knowledge:
+**How strategies work:** Based on the API patterns observed in the SDK and the [official memory strategies documentation](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/memory-strategies.html), when events are created in the memory, AgentCore's backend asynchronously processes them through configured strategies. These strategies use LLMs to extract structured knowledge:
 - **`summaryMemoryStrategy`** — Summarizes conversation sessions
 - **`userPreferenceMemoryStrategy`** — Learns user preferences ("likes sushi", "prefers dark mode")
 - **`semanticMemoryStrategy`** — Extracts factual information ("works at Company X", "has a dog named Max")
@@ -903,7 +907,7 @@ The [Bedrock AgentCore Starter Toolkit](https://github.com/aws/bedrock-agentcore
 
 The [AWS CDK for AgentCore](https://docs.aws.amazon.com/cdk/api/v2/docs/aws-cdk-lib.aws_bedrockagentcore-readme.html) provides infrastructure-as-code for production deployments.
 
-**What happens during deployment (hypothesis based on SDK patterns):**
+**What happens during deployment (based on SDK patterns and [official documentation](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-get-started-toolkit.html)):**
 
 1. Your container image is pushed to ECR
 2. AgentCore provisions compute infrastructure
@@ -1014,7 +1018,7 @@ AgentCore provides built-in observability through OpenTelemetry:
 - **ADOT tracing** — OpenTelemetry spans are exported in AWS Distro for OpenTelemetry format. The [`span_to_adot_serializer`](../src/bedrock_agentcore/evaluation/span_to_adot_serializer/) module handles conversion
 - **CloudWatch integration** — Spans flow to CloudWatch via ADOT, where they can be queried using [`fetch_spans_from_cloudwatch`](../src/bedrock_agentcore/evaluation/utils/cloudwatch_span_helper.py)
 
-**Hypothesis on ADOT integration:** When running in AgentCore Runtime, an ADOT collector sidecar (or agent) is likely injected into the container, automatically collecting OpenTelemetry spans from instrumented frameworks (like Strands) and exporting them to CloudWatch. The evaluation system then queries these spans.
+**ADOT integration:** Based on the SDK's `span_to_adot_serializer` module and CloudWatch integration code, when running in AgentCore Runtime, an ADOT (AWS Distro for OpenTelemetry) collector is configured alongside the container, automatically collecting OpenTelemetry spans from instrumented frameworks (like Strands) and exporting them to CloudWatch. The evaluation system then queries these spans via the `fetch_spans_from_cloudwatch` utility. For more details, see the [AgentCore Observability documentation](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/observability-get-started.html).
 
 ---
 
