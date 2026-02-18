@@ -225,7 +225,7 @@ The `/ping` endpoint tells AgentCore Runtime whether your container is ready for
 |---|---|
 | Method | `GET` |
 | Response Content-Type | `application/json` |
-| Response body | `{"status": "Healthy" \| "HealthyBusy", "time_of_last_update": <unix_timestamp>}` |
+| Response body | `{"status": "Healthy" or "HealthyBusy", "time_of_last_update": <unix_timestamp>}` |
 
 **Status values:**
 
@@ -501,7 +501,7 @@ app.post("/invocations", async (req, res) => {
 **Key takeaway:** The BedrockAgentCoreApp contract is a set of HTTP/WebSocket conventions. The Python SDK provides decorators (`@app.entrypoint`, `@app.websocket`, `@app.ping`) and automatic serialization to make this easy, but any language can implement the same contract by:
 
 1. Serving `POST /invocations` that accepts JSON and returns JSON (or SSE for streaming)
-2. Serving `GET /ping` that returns `{"status": "Healthy"|"HealthyBusy", "time_of_last_update": <unix_ts>}`
+2. Serving `GET /ping` that returns `{"status": "Healthy" or "HealthyBusy", "time_of_last_update": <unix_ts>}`
 3. Serving `WS /ws` for bidirectional communication
 4. Reading AgentCore headers (`X-Amzn-Bedrock-AgentCore-Runtime-*`) for request context
 5. Listening on port **8080**
