@@ -9,6 +9,13 @@ This guide walks you through every aspect of building, testing, deploying, and i
 - [1. Architecture Overview](#1-architecture-overview)
   - [1.1 What is Bedrock AgentCore?](#11-what-is-bedrock-agentcore)
   - [1.2 SDK Architecture and Underlying Technology](#12-sdk-architecture-and-underlying-technology)
+  - [1.3 The BedrockAgentCoreApp Contract](#13-the-bedrockagentcoreapp-contract)
+    - [1.3.1 The `/invocations` Route Contract](#131-the-invocations-route-contract)
+    - [1.3.2 The `/ws` WebSocket Route Contract](#132-the-ws-websocket-route-contract)
+    - [1.3.3 The `/ping` Health Check Contract](#133-the-ping-health-check-contract)
+    - [1.3.4 Request Context Contract](#134-request-context-contract)
+    - [1.3.5 Serialization Contract](#135-serialization-contract)
+    - [1.3.6 Cross-Framework and Cross-Language Examples](#136-cross-framework-and-cross-language-examples)
 - [2. Writing Agent Code — Multiple Approaches](#2-writing-agent-code--multiple-approaches)
   - [2.1 Minimal Agent (Framework-Free)](#21-minimal-agent-framework-free)
   - [2.2 Strands Agent Framework](#22-strands-agent-framework)
@@ -96,6 +103,408 @@ This is how AgentCore Runtime knows whether to route new requests to your contai
 **AWS API Communication** uses two types of endpoints ([`src/bedrock_agentcore/_utils/endpoints.py`](../src/bedrock_agentcore/_utils/endpoints.py)):
 - **Control Plane** (`bedrock-agentcore-control.{region}.amazonaws.com`): Resource management (create/delete memories, browsers, code interpreters)
 - **Data Plane** (`bedrock-agentcore.{region}.amazonaws.com`): Runtime operations (invoke agents, read/write memory events, execute code)
+
+### 1.3 The BedrockAgentCoreApp Contract
+
+`BedrockAgentCoreApp` defines a **runtime contract** between your agent logic and the Bedrock AgentCore infrastructure. Regardless of which agent framework or programming language you use, your code must conform to this contract so that the AgentCore Runtime can invoke your agent, check its health, and communicate over WebSocket. This section spells out each part of the contract in detail.
+
+At a high level, the contract is:
+
+| Route | Method | Purpose | Your Responsibility |
+|---|---|---|---|
+| `/invocations` | POST | Invoke the agent | Register an entrypoint handler that accepts a JSON payload and returns a JSON-serializable result (or a stream) |
+| `/ws` | WebSocket | Bidirectional streaming | Register a WebSocket handler that accepts and sends messages over a persistent connection |
+| `/ping` | GET | Health check | (Optional) Register a custom ping handler, or let the SDK manage status automatically |
+
+The server **must** listen on port **8080** (the default). AgentCore Runtime connects to your container on this port.
+
+#### 1.3.1 The `/invocations` Route Contract
+
+The `/invocations` route is the primary way AgentCore invokes your agent. It defines a strict contract between caller and handler.
+
+**Request format:**
+
+| Component | Requirement |
+|---|---|
+| Method | `POST` |
+| Content-Type | `application/json` |
+| Body | Arbitrary JSON object (the "payload") — structure is defined by your agent |
+| Headers (set by AgentCore) | `X-Amzn-Bedrock-AgentCore-Runtime-Request-Id`, `X-Amzn-Bedrock-AgentCore-Runtime-Session-Id`, `WorkloadAccessToken`, `OAuth2CallbackUrl`, `Authorization`, and any `X-Amzn-Bedrock-AgentCore-Runtime-Custom-*` headers |
+
+**Handler signature contract:**
+
+Your entrypoint function registered via `@app.entrypoint` must follow one of these signatures:
+
+```python
+# Signature 1: Payload only
+@app.entrypoint
+async def my_handler(payload: dict):
+    ...
+
+# Signature 2: Payload + RequestContext (second parameter MUST be named "context")
+@app.entrypoint
+async def my_handler(payload: dict, context: RequestContext):
+    ...
+```
+
+The SDK inspects your handler's signature at call time. If the second parameter is named `context`, the SDK passes a `RequestContext` object ([`src/bedrock_agentcore/runtime/context.py`](../src/bedrock_agentcore/runtime/context.py)). Both sync and async handlers are supported — sync handlers are automatically run in a thread executor with context variables propagated.
+
+**Response contract:**
+
+| Return Type | HTTP Response |
+|---|---|
+| `dict`, `list`, `str`, `int`, Pydantic model, dataclass, or any JSON-serializable object | `200 OK` with `Content-Type: application/json` |
+| `yield` values (sync generator) | `200 OK` with `Content-Type: text/event-stream` (SSE) — each yielded value becomes `data: {json}\n\n` |
+| `yield` values (async generator) | Same SSE format as sync generator |
+| Raises an exception | `500 Internal Server Error` with `{"error": "..."}` |
+| Invalid JSON in request body | `400 Bad Request` with `{"error": "Invalid JSON", "details": "..."}` |
+
+**SSE streaming format detail:**
+
+When your handler is a generator, each yielded value is serialized to this exact format:
+
+```
+data: {"chunk": 0, "text": "Processing..."}\n\n
+data: {"chunk": 1, "text": "More output..."}\n\n
+```
+
+Each event is a JSON object prefixed by `data: ` and followed by two newlines. Clients should parse the SSE stream accordingly.
+
+#### 1.3.2 The `/ws` WebSocket Route Contract
+
+The `/ws` route provides full-duplex, long-lived communication. This is used for interactive agents that need to send and receive messages over time.
+
+**Connection lifecycle:**
+
+1. Client opens a WebSocket connection to `/ws`
+2. The SDK extracts request context from the WebSocket handshake headers (same headers as `/invocations`)
+3. The SDK calls your registered `@app.websocket` handler with `(websocket, context)`
+4. **Your handler must call `await websocket.accept()`** to complete the handshake
+5. Your handler manages the message loop (send/receive) until the connection closes
+6. If no `@app.websocket` handler is registered, the SDK closes the connection with code `1011`
+
+**Handler signature contract:**
+
+```python
+@app.websocket
+async def my_ws_handler(websocket: WebSocket, context: RequestContext):
+    await websocket.accept()
+    # ... your message loop ...
+```
+
+The handler **must** be an async function. It always receives both the Starlette `WebSocket` object and the `RequestContext`. Unlike `/invocations`, the context parameter is always passed (there is no single-parameter form).
+
+**Message contract:**
+
+The SDK does not impose a specific message schema — your handler has full control. However, a recommended pattern is:
+
+```json
+// Client → Agent
+{"action": "query", "message": "What is the weather?"}
+
+// Agent → Client
+{"type": "response", "message": "It's sunny!", "session_id": "abc-123"}
+```
+
+The `websocket` object exposes standard Starlette methods:
+- `await websocket.receive_json()` — receive a JSON message
+- `await websocket.receive_text()` — receive a text message
+- `await websocket.send_json(data)` — send a JSON message
+- `await websocket.send_text(data)` — send a text message
+- `await websocket.close()` — close the connection
+
+**Error handling:** If your handler raises an exception, the SDK catches it and closes the WebSocket with code `1011` (internal error). `WebSocketDisconnect` exceptions are handled gracefully as normal disconnections.
+
+#### 1.3.3 The `/ping` Health Check Contract
+
+The `/ping` endpoint tells AgentCore Runtime whether your container is ready for work.
+
+**Request/Response format:**
+
+| Component | Value |
+|---|---|
+| Method | `GET` |
+| Response Content-Type | `application/json` |
+| Response body | `{"status": "Healthy" or "HealthyBusy", "time_of_last_update": <unix_timestamp>}` |
+
+**Status values:**
+
+- `"Healthy"` — The agent is ready to accept new invocations
+- `"HealthyBusy"` — The agent is alive but currently processing work; AgentCore should avoid sending new requests if possible
+
+**Status determination priority:**
+
+```
+1. Forced status (set via debug actions or app.force_ping_status())      ← highest priority
+2. Custom handler registered with @app.ping
+3. Automatic: HEALTHY_BUSY if any @app.async_task functions are running,
+              HEALTHY otherwise                                          ← lowest priority
+```
+
+This contract is critical for autoscaling. AgentCore Runtime periodically polls `/ping` to decide whether to route traffic to your container or scale up new instances.
+
+#### 1.3.4 Request Context Contract
+
+Every invocation (HTTP or WebSocket) extracts metadata from headers and makes it available to your handler through two mechanisms:
+
+**1. `RequestContext` (passed to your handler):**
+
+```python
+class RequestContext:
+    session_id: Optional[str]        # From X-Amzn-Bedrock-AgentCore-Runtime-Session-Id
+    request_headers: Optional[dict]  # Authorization + X-Amzn-Bedrock-AgentCore-Runtime-Custom-* headers
+    request: Optional[Any]           # The underlying Starlette Request/WebSocket object
+```
+
+**2. `BedrockAgentCoreContext` (thread-safe context variables, accessible anywhere):**
+
+```python
+from bedrock_agentcore import BedrockAgentCoreContext
+
+# Available in any code called during request processing
+request_id = BedrockAgentCoreContext.get_request_id()      # From X-Amzn-Bedrock-AgentCore-Runtime-Request-Id
+session_id = BedrockAgentCoreContext.get_session_id()       # From X-Amzn-Bedrock-AgentCore-Runtime-Session-Id
+token = BedrockAgentCoreContext.get_workload_access_token() # From WorkloadAccessToken header
+url = BedrockAgentCoreContext.get_oauth2_callback_url()     # From OAuth2CallbackUrl header
+headers = BedrockAgentCoreContext.get_request_headers()     # Authorization + custom headers
+```
+
+`BedrockAgentCoreContext` uses Python `contextvars`, so the values are automatically scoped to the current request — even across async tasks and thread executors.
+
+#### 1.3.5 Serialization Contract
+
+The SDK applies a **progressive fallback** strategy when serializing your handler's return value to JSON:
+
+```
+1. json.dumps(obj)                           ← direct JSON serialization
+2. convert_complex_objects(obj) → json.dumps  ← handles Pydantic .model_dump(), dataclasses asdict()
+3. json.dumps(str(obj))                       ← string fallback
+4. {"error": "Serialization failed", ...}     ← final fallback
+```
+
+This means your handler can return:
+- Plain dicts, lists, strings, numbers
+- Pydantic models (serialized via `.model_dump()`)
+- Dataclasses (serialized via `dataclasses.asdict()`)
+- Any object with a string representation (as a last resort)
+
+For streaming responses, each yielded value goes through the same serialization pipeline before being wrapped in SSE format.
+
+#### 1.3.6 Cross-Framework and Cross-Language Examples
+
+The `BedrockAgentCoreApp` contract is **implementation-agnostic**. Any language or framework can implement a compatible server by satisfying the route, request, and response contracts defined above. Below are examples showing how the same contract is fulfilled across different frameworks and languages.
+
+**Python — Framework-Free (minimal contract implementation):**
+
+```python
+from bedrock_agentcore import BedrockAgentCoreApp, RequestContext
+
+app = BedrockAgentCoreApp()
+
+@app.entrypoint
+async def invoke(payload: dict, context: RequestContext):
+    """Contract: receives JSON payload, optionally receives context, returns JSON-serializable result."""
+    user_message = payload.get("prompt", "")
+    return {
+        "response": f"Echo: {user_message}",
+        "session_id": context.session_id,
+    }
+
+app.run()  # Serves on port 8080 with POST /invocations, GET /ping, WS /ws
+```
+
+**Python — Strands Agent Framework:**
+
+```python
+from bedrock_agentcore import BedrockAgentCoreApp
+from strands import Agent
+
+app = BedrockAgentCoreApp()
+agent = Agent(system_prompt="You are a helpful assistant.")
+
+@app.entrypoint
+async def invoke(payload):
+    """Contract: the Strands Agent result is auto-serialized by the SDK."""
+    result = agent(payload.get("prompt"))
+    return {"response": result.message}
+
+app.run()
+```
+
+**Python — Strands with streaming (async generator contract):**
+
+```python
+from bedrock_agentcore import BedrockAgentCoreApp
+from strands import Agent
+
+app = BedrockAgentCoreApp()
+agent = Agent()
+
+@app.entrypoint
+async def invoke(payload):
+    """Contract: yielding values produces an SSE stream (text/event-stream)."""
+    stream = agent.stream_async(payload.get("prompt", ""))
+    async for event in stream:
+        yield event  # Each yield → data: {json}\n\n
+
+app.run()
+```
+
+**Python — LangGraph:**
+
+```python
+from bedrock_agentcore import BedrockAgentCoreApp
+from langgraph.graph import StateGraph
+# ... define your LangGraph workflow ...
+
+app = BedrockAgentCoreApp()
+graph = build_my_langgraph()
+
+@app.entrypoint
+async def invoke(payload):
+    """Contract: LangGraph result dict is directly JSON-serializable."""
+    result = await graph.ainvoke({"input": payload.get("prompt")})
+    return result
+
+app.run()
+```
+
+**Python — CrewAI:**
+
+```python
+from bedrock_agentcore import BedrockAgentCoreApp
+from crewai import Crew, Agent, Task
+
+app = BedrockAgentCoreApp()
+crew = Crew(agents=[...], tasks=[...])
+
+@app.entrypoint
+def invoke(payload):
+    """Contract: sync handlers are run in a thread executor automatically."""
+    result = crew.kickoff(inputs={"query": payload.get("prompt")})
+    return {"result": str(result)}
+
+app.run()
+```
+
+**Python — WebSocket handler (bidirectional contract):**
+
+```python
+from bedrock_agentcore import BedrockAgentCoreApp
+
+app = BedrockAgentCoreApp()
+
+@app.websocket
+async def ws_handler(websocket, context):
+    """Contract: must call accept(), receives (websocket, context), manages message loop."""
+    await websocket.accept()
+    try:
+        while True:
+            data = await websocket.receive_json()
+            response = process(data)  # Your agent logic
+            await websocket.send_json({"response": response, "session_id": context.session_id})
+    except Exception:
+        await websocket.close()
+
+app.run()
+```
+
+**Python — Custom ping handler (health check contract):**
+
+```python
+from bedrock_agentcore import BedrockAgentCoreApp, PingStatus
+
+app = BedrockAgentCoreApp()
+
+@app.ping
+def health_check():
+    """Contract: return PingStatus.HEALTHY or PingStatus.HEALTHY_BUSY."""
+    if is_processing_heavy_workload():
+        return PingStatus.HEALTHY_BUSY
+    return PingStatus.HEALTHY
+```
+
+**TypeScript / JavaScript — Equivalent contract implementation (without the SDK):**
+
+If you are building an agent in TypeScript or JavaScript (e.g., using Express, Fastify, or Deno), you can satisfy the same runtime contract by implementing the three routes manually. Here is a conceptual example using Express:
+
+```typescript
+import express from "express";
+import expressWs from "express-ws";
+
+const app = express();
+expressWs(app);
+app.use(express.json());
+
+// Contract: POST /invocations — accepts JSON payload, returns JSON response
+app.post("/invocations", async (req, res) => {
+  const payload = req.body;
+  const sessionId = req.headers["x-amzn-bedrock-agentcore-runtime-session-id"];
+  const requestId = req.headers["x-amzn-bedrock-agentcore-runtime-request-id"];
+
+  try {
+    // Your agent logic here (call any LLM, framework, etc.)
+    const result = { response: `Echo: ${payload.prompt}`, session_id: sessionId };
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Contract: GET /ping — returns health status
+app.get("/ping", (req, res) => {
+  res.json({ status: "Healthy", time_of_last_update: Math.floor(Date.now() / 1000) });
+});
+
+// Contract: WS /ws — bidirectional WebSocket communication
+(app as any).ws("/ws", (ws, req) => {
+  const sessionId = req.headers["x-amzn-bedrock-agentcore-runtime-session-id"];
+
+  ws.on("message", (msg: string) => {
+    const data = JSON.parse(msg);
+    // Your agent logic here
+    ws.send(JSON.stringify({ type: "response", message: `Echo: ${data.message}`, session_id: sessionId }));
+  });
+
+  ws.on("close", () => {
+    console.log("WebSocket closed");
+  });
+});
+
+// Contract: must listen on port 8080
+app.listen(8080, "0.0.0.0", () => {
+  console.log("Agent server running on port 8080");
+});
+```
+
+**TypeScript — SSE streaming response (matching the `/invocations` streaming contract):**
+
+```typescript
+app.post("/invocations", async (req, res) => {
+  const payload = req.body;
+
+  // Set SSE headers to match the Python SDK's StreamingResponse behavior
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+
+  // Stream chunks in the same SSE format: data: {json}\n\n
+  for (let i = 0; i < 5; i++) {
+    const chunk = JSON.stringify({ chunk: i, text: `Processing chunk ${i}...` });
+    res.write(`data: ${chunk}\n\n`);
+  }
+  res.write(`data: ${JSON.stringify({ chunk: "final", text: "Done!" })}\n\n`);
+  res.end();
+});
+```
+
+**Key takeaway:** The BedrockAgentCoreApp contract is a set of HTTP/WebSocket conventions. The Python SDK provides decorators (`@app.entrypoint`, `@app.websocket`, `@app.ping`) and automatic serialization to make this easy, but any language can implement the same contract by:
+
+1. Serving `POST /invocations` that accepts JSON and returns JSON (or SSE for streaming)
+2. Serving `GET /ping` that returns `{"status": "Healthy" or "HealthyBusy", "time_of_last_update": <unix_ts>}`
+3. Serving `WS /ws` for bidirectional communication
+4. Reading AgentCore headers (`X-Amzn-Bedrock-AgentCore-Runtime-*`) for request context
+5. Listening on port **8080**
 
 ---
 
