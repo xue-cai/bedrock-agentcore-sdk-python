@@ -830,6 +830,97 @@ The memory system has a hierarchical structure:
 - **Events** → Individual conversation turns within a session
 - **Branches** → Alternative conversation paths (for A/B testing)
 
+#### ID Lifecycle
+
+Each level in the hierarchy has an identifier with its own creation and end-of-life semantics:
+
+| ID | Created by | How it is created | Lifetime / End |
+|---|---|---|---|
+| **`memory_id`** | AWS service (server-generated) | Returned by `MemoryControlPlaneClient.create_memory()`. The service assigns the ID. | Ends when you call `delete_memory(memory_id)`. Deleting a memory removes all actors, sessions, events, and long-term records within it. |
+| **`actor_id`** | Client (user-defined string) | You supply it when calling `manager.create_memory_session(actor_id=...)` or `manager.add_turns(actor_id=...)`. No separate "create actor" API exists — an actor materializes the first time an event is created with that `actor_id`. | Implicit — the actor exists as long as there are events referencing it. Deleting all of an actor's events (or deleting the parent memory) effectively removes the actor. |
+| **`session_id`** | Client (user-defined or auto-generated UUID4) | Passed to `manager.create_memory_session(session_id=...)`. If omitted, the SDK auto-generates one via `uuid.uuid4()` ([`session.py` line 1082](../src/bedrock_agentcore/memory/session.py)). Like actors, a session materializes on the first `create_event` call with that `session_id`. | Implicit — a session exists as long as there are events in it. Events may also expire based on the `eventExpiryDuration` configured on the memory (default 90 days). |
+| **`event_id`** | AWS service (server-generated) | Returned by `manager.add_turns()` / `session.add_turns()`, which calls the `create_event` data-plane API. Each call produces one event containing one or more messages. | Ends when you call `delete_event(event_id)`, when the event's TTL (`eventExpiryDuration`) expires, or when the parent memory is deleted. |
+| **`branch_id`** | Client (user-defined name + root event) | Created by calling `session.fork_conversation(root_event_id, branch_name, messages)`. A branch is identified by the combination of `branch_name` and `rootEventId`. | Implicit — a branch exists as long as events reference it. Deleting all events on a branch effectively removes the branch. |
+
+> **Key takeaway:** `memory_id` and `event_id` are server-generated; `actor_id`, `session_id`, and `branch_id` (branch name) are client-supplied. Actors, sessions, and branches are not created explicitly — they come into existence the moment the first event references them, and they disappear when no events reference them.
+
+#### Real-World Use Case: Customer-Support Bot
+
+Imagine you are building **SupportBot**, a customer-support agent for an e-commerce company. Here is how the memory hierarchy maps to real-world concepts:
+
+| Memory concept | Real-world meaning | Example value |
+|---|---|---|
+| **Memory** (`memory_id`) | The SupportBot application's memory store — one per deployment/environment. | `"mem-a1b2c3"` (returned by `create_memory`) |
+| **Actor** (`actor_id`) | A customer or support agent interacting with SupportBot. | `"customer-jane-doe-9271"` |
+| **Session** (`session_id`) | One support ticket / conversation thread. | `"ticket-20260219-001"` |
+| **Event** (`event_id`) | A single request-response exchange inside that ticket. | `"evt-x7y8z9"` (server-generated) |
+| **Branch** (`branch_name`) | An A/B test where SupportBot tries two different resolution paths for the same ticket. | `"refund-path"` / `"replacement-path"` |
+
+```python
+# 1️⃣  One-time setup — create the memory store (control plane)
+from bedrock_agentcore.memory import MemoryControlPlaneClient
+
+cp = MemoryControlPlaneClient(region_name="us-east-1")
+memory = cp.create_memory(
+    name="SupportBotMemory",
+    event_expiry_days=180,                       # keep transcripts 6 months
+    strategies=[{
+        "userPreferenceMemoryStrategy": {
+            "name": "CustomerPreferences",
+            "namespaces": ["/preferences/{actorId}/"]
+        }
+    }],
+    wait_for_active=True,
+)
+memory_id = memory["id"]                         # ← server-generated memory_id
+
+# 2️⃣  At runtime — handle a support conversation (data plane)
+from bedrock_agentcore.memory import MemorySessionManager
+from bedrock_agentcore.memory.constants import ConversationalMessage, MessageRole
+
+manager = MemorySessionManager(memory_id=memory_id, region_name="us-east-1")
+
+# actor_id = the customer; session_id = the support ticket
+session = manager.create_memory_session(
+    actor_id="customer-jane-doe-9271",           # ← client-supplied actor_id
+    session_id="ticket-20260219-001",            # ← client-supplied session_id
+)
+
+# 3️⃣  Each exchange creates an event with a server-generated event_id
+event = session.add_turns([
+    ConversationalMessage("My order #1234 hasn't arrived.", MessageRole.USER),
+    ConversationalMessage("I'm sorry to hear that. Let me look into order #1234 for you.", MessageRole.ASSISTANT),
+])
+print(event["eventId"])                          # ← server-generated event_id
+
+# 4️⃣  A/B test two resolution paths by branching
+session.fork_conversation(
+    root_event_id=event["eventId"],              # fork from the first exchange
+    branch_name="refund-path",                   # ← client-supplied branch name
+    messages=[
+        ConversationalMessage("I can offer a full refund.", MessageRole.ASSISTANT),
+    ],
+)
+session.fork_conversation(
+    root_event_id=event["eventId"],
+    branch_name="replacement-path",
+    messages=[
+        ConversationalMessage("I can send a replacement right away.", MessageRole.ASSISTANT),
+    ],
+)
+
+# 5️⃣  Later — recall what the customer prefers (long-term memory)
+memories = session.search_long_term_memories(
+    query="what does this customer prefer",
+    namespace_prefix="/preferences/customer-jane-doe-9271/",
+    top_k=5,
+)
+
+# 6️⃣  Clean up a single event or the entire memory
+session.delete_event(event["eventId"])           # removes one event
+# cp.delete_memory(memory_id)                   # removes everything
+```
+
 There are two client interfaces:
 1. **`MemorySessionManager` + `MemorySession`** (recommended) — Session-scoped, clean API
 2. **`MemoryClient`** (legacy) — Lower-level, requires passing IDs everywhere
